@@ -33,7 +33,6 @@ bool DFRobot_QMC5883::begin()
       {
         ICType = IC_HMC5883L;
         this->ICAddr = HMC5883L_ADDRESS;
-        Serial.println("ICType = IC_HMC5883L");
         break;
       }
     }
@@ -68,9 +67,6 @@ bool DFRobot_QMC5883::begin()
   }
   switch (ICType)
   {
-  case IC_NONE:
-    ret = false;
-    break;
   case IC_HMC5883L:
     if ((fastRegister8(HMC5883L_REG_IDENT_A) != 0x48) || (fastRegister8(HMC5883L_REG_IDENT_B) != 0x34) || (fastRegister8(HMC5883L_REG_IDENT_C) != 0x33))
     {
@@ -80,38 +76,66 @@ bool DFRobot_QMC5883::begin()
     setMeasurementMode(HMC5883L_CONTINOUS);
     setDataRate(HMC5883L_DATARATE_15HZ);
     setSamples(HMC5883L_SAMPLES_1);
-    mgPerDigit = 0.92f;
     ret = true;
-    Serial.println("IC_HMC5883L");
+
     break;
   case IC_QMC5883:
+    // Perform soft reset
+    writeRegister8(QMC5883_REG_CONFIG_2, 0b10000000);
+    // Define Set/Reset period
     writeRegister8(QMC5883_REG_IDENT_B, 0X01);
-    writeRegister8(QMC5883_REG_IDENT_C, 0X40);
-    writeRegister8(QMC5883_REG_IDENT_D, 0X01);
-    writeRegister8(QMC5883_REG_CONFIG_1, 0X1D);
-    if ((fastRegister8(QMC5883_REG_IDENT_B) != 0x01) || (fastRegister8(QMC5883_REG_IDENT_C) != 0x40) || (fastRegister8(QMC5883_REG_IDENT_D) != 0x01))
+
+    //writeRegister8(QMC5883_REG_IDENT_C, 0X40);
+    //writeRegister8(QMC5883_REG_IDENT_D, 0X01);
+    // Write initail settings
+    writeRegister8(QMC5883_REG_CONFIG_1, 0b00011101);
+    if (fastRegister8(QMC5883_REG_CONFIG_1) != 0b00011101)
     {
       return false;
     }
     setRange(QMC5883_RANGE_8GA);
     setMeasurementMode(QMC5883_CONTINOUS);
     setDataRate(QMC5883_DATARATE_50HZ);
-    setSamples(QMC5883_SAMPLES_8);
-    mgPerDigit = 4.35f;
+    setSamples(QMC5883_OVERSAMPLERATIO_512);
     ret = true;
-    Serial.println("IC_QMC5883");
     break;
   case IC_VCM5883L:
     writeRegister8(VCM5883L_CTR_REG1, 0X00);
     writeRegister8(VCM5883L_CTR_REG2, 0X4D);
     ret = true;
-    Serial.println("IC_VCM5883L");
     break;
+  case IC_NONE:
   default:
     ret = false;
     break;
   }
   return ret;
+}
+
+bool DFRobot_QMC5883::isDataReady(void)
+{
+  if (ICType == IC_QMC5883)
+  {
+    int8_t status = readRegister8(QMC5883_REG_STATUS);
+    // Data Ready Register (DRDY), it is set when all three axis data is ready,
+    // and loaded to the output data registers in the continuous measurement mode.
+    // It is reset to “0” by reading any data register
+    bool dataReady = (status & 0b00000001) == 0b1;
+    // Overflow flag (OVL) is set to “1” if any data of three axis magnetic sensor channels is out of range
+    bool dataOverflow = (status & 0b00000010) == 0b10;
+
+    return dataReady & !dataOverflow;
+  }
+  return true;
+}
+
+int16_t DFRobot_QMC5883::readTempRaw(void)
+{
+  if (ICType == IC_QMC5883)
+  {
+    temp = readRegister16(QMC5883_REG_OUT_TEMP_1);
+  }
+  return temp;
 }
 
 Vector DFRobot_QMC5883::readRaw(void)
@@ -134,40 +158,142 @@ Vector DFRobot_QMC5883::readRaw(void)
     v.YAxis = -readRegister16(VCM5883L_REG_OUT_Y_L);
     v.ZAxis = -readRegister16(VCM5883L_REG_OUT_Z_L);
   }
-  v.AngleXY = (atan2((double)v.YAxis, (double)v.XAxis) * (180 / 3.14159265) + 180);
-  v.AngleXZ = (atan2((double)v.ZAxis, (double)v.XAxis) * (180 / 3.14159265) + 180);
-  v.AngleYZ = (atan2((double)v.ZAxis, (double)v.YAxis) * (180 / 3.14159265) + 180);
+  //v.AngleXY = (atan2((double)v.YAxis, (double)v.XAxis) * (180 / PI) + 180);
+  //v.AngleXZ = (atan2((double)v.ZAxis, (double)v.XAxis) * (180 / PI) + 180);
+  //v.AngleYZ = (atan2((double)v.ZAxis, (double)v.YAxis) * (180 / PI) + 180);
   return v;
+}
+
+VectorScaled DFRobot_QMC5883::readScaled(void)
+{
+  if (isDataReady())
+  {
+    Vector raw = readRaw();
+    s.XAxis = m_Scale * raw.XAxis;
+    s.YAxis = m_Scale * raw.YAxis;
+    s.ZAxis = m_Scale * raw.ZAxis;
+    calibrate();
+    s.XAxis -= offset.XAxis;
+    s.YAxis -= offset.YAxis;
+    s.ZAxis -= offset.ZAxis;
+  }
+  return s;
+}
+
+Calibration DFRobot_QMC5883::readCalibration(void)
+{
+  newCalibration = false;
+  Calibration cal;
+  cal.min = min;
+  cal.max = max;
+  cal.offset = offset;
+  return cal;
+}
+
+void DFRobot_QMC5883::setCalibration(Calibration calibration)
+{
+  newCalibration = false;
+  min = calibration.min;
+  max = calibration.max;
+  offset = calibration.offset;
+}
+
+void DFRobot_QMC5883::setDeclinationAngle(float declinationAngle)
+{
+  this->ICdeclinationAngle = declinationAngle;
+}
+
+float DFRobot_QMC5883::readHeadingDegrees()
+{
+  VectorScaled scaled = readScaled();
+
+  double heading = atan2(scaled.YAxis, scaled.XAxis);
+
+  heading += this->ICdeclinationAngle;
+
+  // Correct for when signs are reversed.
+  if (heading < 0.0)
+  {
+    heading += (2.0 * PI);
+  }
+  // Check for wrap due to addition of declination.
+  else if (heading > (2.0 * PI))
+  {
+    heading -= (2.0 * PI);
+  }
+  // Convert radians to degrees for readability.
+  heading = heading * (180.0 / PI);
+
+  float ret = (float)heading;
+  return ret;
 }
 
 void DFRobot_QMC5883::calibrate()
 {
-  if (v.XAxis < minX)
-    minX = v.XAxis;
-  if (v.XAxis > maxX)
-    maxX = v.XAxis;
-  if (v.YAxis < minY)
-    minY = v.YAxis;
-  if (v.YAxis > maxY)
-    maxY = v.YAxis;
-  if (v.ZAxis < minZ)
-    minZ = v.ZAxis;
-  if (v.ZAxis > maxZ)
-    maxZ = v.ZAxis;
-}
+  if (fabs(s.XAxis) > 600 || fabs(s.YAxis) > 600 || fabs(s.ZAxis) > 600)
+  {
+    return;
+  }
 
-void DFRobot_QMC5883::initMinMax()
-{
-  minX = v.XAxis;
-  maxX = v.XAxis;
-  minY = v.YAxis;
-  maxY = v.YAxis;
-  minZ = v.ZAxis;
-  maxZ = v.ZAxis;
+  bool calibrationChanged = false;
+
+  if (!minmaxset)
+  {
+    minmaxset = true;
+    min.XAxis = s.XAxis;
+    max.XAxis = s.XAxis;
+    min.YAxis = s.YAxis;
+    max.YAxis = s.YAxis;
+    min.ZAxis = s.ZAxis;
+    max.ZAxis = s.ZAxis;
+    calibrationChanged = true;
+  }
+  else
+  {
+    if (s.XAxis < min.XAxis)
+    {
+      min.XAxis = s.XAxis;
+      calibrationChanged = true;
+    }
+    else if (s.XAxis > max.XAxis)
+    {
+      max.XAxis = s.XAxis;
+      calibrationChanged = true;
+    }
+    if (s.YAxis < min.YAxis)
+    {
+      min.YAxis = s.YAxis;
+      calibrationChanged = true;
+    }
+    else if (s.YAxis > max.YAxis)
+    {
+      max.YAxis = s.YAxis;
+      calibrationChanged = true;
+    }
+    if (s.ZAxis < min.ZAxis)
+    {
+      min.ZAxis = s.ZAxis;
+      calibrationChanged = true;
+    }
+    else if (s.ZAxis > max.ZAxis)
+    {
+      max.ZAxis = s.ZAxis;
+      calibrationChanged = true;
+    }
+  }
+
+  if (calibrationChanged)
+  {
+    newCalibration = true;
+    offset.XAxis = (max.XAxis + min.XAxis) / 2;
+    offset.YAxis = (max.YAxis + min.YAxis) / 2;
+    offset.ZAxis = (max.ZAxis + min.ZAxis) / 2;
+  }
 }
 
 void DFRobot_QMC5883::setRange(QMC5883_range_t range)
 {
+  uint8_t value;
   if (ICType == IC_HMC5883L)
   {
     switch (range)
@@ -207,48 +333,60 @@ void DFRobot_QMC5883::setRange(QMC5883_range_t range)
       break;
     }
 
-    writeRegister8(HMC5883L_REG_CONFIG_B, range << 5);
+    value = readRegister8(HMC5883L_REG_CONFIG_B);
+    value &= 0b00011111;
+    value |= (range << 5);
+    writeRegister8(HMC5883L_REG_CONFIG_B, value);
   }
   else if (ICType == IC_QMC5883)
   {
     switch (range)
     {
     case QMC5883_RANGE_2GA:
-      mgPerDigit = 1.22f;
+      // 12'000 LSB/G
+      Gauss_LSB_XY = 12000;
       break;
     case QMC5883_RANGE_8GA:
-      mgPerDigit = 4.35f;
+      //  3'000 LSB/G
+      Gauss_LSB_XY = 3000;
       break;
     default:
       break;
     }
-    writeRegister8(QMC5883_REG_CONFIG_2, range << 4);
+    value = readRegister8(QMC5883_REG_CONFIG_1);
+    value &= 0b11001111;
+    value |= (range << 4);
+    writeRegister8(QMC5883_REG_CONFIG_1, value);
   }
   else if (ICType == IC_VCM5883L)
   {
     //default 8G
   }
+  m_Scale = 1000 / Gauss_LSB_XY;
 }
 
 QMC5883_range_t DFRobot_QMC5883::getRange(void)
 {
-  QMC5883_range_t ret;
+  uint8_t value = 0;
   switch (ICType)
   {
   case IC_HMC5883L:
-    ret = (QMC5883_range_t)((readRegister8(HMC5883L_REG_CONFIG_B) >> 5));
+    value = readRegister8(HMC5883L_REG_CONFIG_B);
+    value &= 0b11100000;
+    value >>= 5;
     break;
   case IC_QMC5883:
-    ret = (QMC5883_range_t)((readRegister8(QMC5883_REG_CONFIG_2) >> 4));
+    value = readRegister8(QMC5883_REG_CONFIG_1);
+    value &= 0b00110000;
+    value >>= 4;
     break;
   case IC_VCM5883L:
-    ret = QMC5883_RANGE_8GA;
+    value = QMC5883_RANGE_8GA;
     break;
   default:
-    ret = QMC5883_RANGE_8GA;
     break;
   }
-  return ret;
+  return (QMC5883_range_t)value;
 }
 
 void DFRobot_QMC5883::setMeasurementMode(QMC5883_mode_t mode)
@@ -264,13 +402,13 @@ void DFRobot_QMC5883::setMeasurementMode(QMC5883_mode_t mode)
     break;
   case IC_QMC5883:
     value = readRegister8(QMC5883_REG_CONFIG_1);
-    value &= 0xfc;
+    value &= 0b11111100;
     value |= mode;
     writeRegister8(QMC5883_REG_CONFIG_1, value);
     break;
   case IC_VCM5883L:
     value = readRegister8(VCM5883L_CTR_REG2);
-    value &= 0xFE;
+    value &= 0b11111110;
     value |= mode;
     writeRegister8(VCM5883L_CTR_REG2, value);
     break;
@@ -315,13 +453,13 @@ void DFRobot_QMC5883::setDataRate(QMC5883_dataRate_t dataRate)
     break;
   case IC_QMC5883:
     value = readRegister8(QMC5883_REG_CONFIG_1);
-    value &= 0xf3;
+    value &= 0b11110011;
     value |= (dataRate << 2);
     writeRegister8(QMC5883_REG_CONFIG_1, value);
     break;
   case IC_VCM5883L:
     value = readRegister8(VCM5883L_CTR_REG2);
-    value &= 0xf3;
+    value &= 0b11110011;
     value |= (dataRate << 2);
     writeRegister8(VCM5883L_CTR_REG2, value);
     break;
@@ -369,15 +507,15 @@ void DFRobot_QMC5883::setSamples(QMC5883_samples_t samples)
     break;
   case IC_QMC5883:
     value = readRegister8(QMC5883_REG_CONFIG_1);
-    value &= 0x3f;
+    value &= 0b00111111;
     value |= (samples << 6);
     writeRegister8(QMC5883_REG_CONFIG_1, value);
     break;
   case IC_VCM5883L:
-    value = readRegister8(QMC5883_REG_CONFIG_1);
-    value &= 0x3f;
+    value = readRegister8(VCM5883L_CTR_REG1);
+    value &= 0b00111111;
     value |= (samples << 6);
-    writeRegister8(QMC5883_REG_CONFIG_1, value);
+    writeRegister8(VCM5883L_CTR_REG1, value);
     break;
   default:
     break;
@@ -396,39 +534,18 @@ QMC5883_samples_t DFRobot_QMC5883::getSamples(void)
     break;
   case IC_QMC5883:
     value = readRegister8(QMC5883_REG_CONFIG_1);
-    value &= 0x3f;
+    value &= 0b00111111;
     value >>= 6;
     break;
   case IC_VCM5883L:
-    value = readRegister8(QMC5883_REG_CONFIG_1);
-    value &= 0x3f;
+    value = readRegister8(VCM5883L_CTR_REG1);
+    value &= 0b00111111;
     value >>= 6;
     break;
   default:
     break;
   }
   return (QMC5883_samples_t)value;
-}
-
-void DFRobot_QMC5883::setDeclinationAngle(float declinationAngle)
-{
-  this->ICdeclinationAngle = declinationAngle;
-}
-
-void DFRobot_QMC5883::getHeadingDegrees()
-{
-  //double XuT,YuT,ZuT;
-  //readRaw();
-  //XuT = v.XAxis / Gauss_LSB_XY * 100;
-  //YuT = v.YAxis / Gauss_LSB_XY * 100;
-  //ZuT = v.ZAxis / Gauss_LSB_XY * 100;
-  float heading = atan2(v.YAxis, v.XAxis);
-  heading += this->ICdeclinationAngle;
-  if (heading < 0)
-    heading += 2 * PI;
-  if (heading > 2 * PI)
-    heading -= 2 * PI;
-  v.HeadingDegress = heading * 180 / PI;
 }
 
 // Write byte to register
@@ -486,6 +603,7 @@ uint8_t DFRobot_QMC5883::readRegister8(uint8_t reg)
 #else
   value = Wire.receive();
 #endif
+  Wire.endTransmission();
   return value;
 }
 
@@ -502,6 +620,7 @@ int16_t DFRobot_QMC5883::readRegister16(uint8_t reg)
 #endif
   Wire.endTransmission();
   Wire.requestFrom((uint8_t)this->ICAddr, (uint8_t)2);
+
   while (!Wire.available())
   {
   };
